@@ -1,0 +1,43 @@
+services:
+  api:
+    build: ../api
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://game:${POSTGRES_PASSWORD}@postgres:5432/game
+      REDIS_ADDR: redis:6379
+      JWT_SECRET: ${JWT_SECRET}
+      PUBLIC_HOST: ${PUBLIC_HOST}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: game
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: game
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U game"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+
+  # Phase 2/4: game server image goes here (one container per match later)
+  # gameserver:
+  #   build: ../game/server-docker
+  #   ports:
+  #     - "7770:7770/udp"
+
+volumes:
+  pgdata:
