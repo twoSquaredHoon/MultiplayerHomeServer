@@ -11,3 +11,5 @@ game/[Ll]ogs/
 game/[Uu]ser[Ss]ettings/
 *.csproj
 *.sln
+
+deploy/backups/

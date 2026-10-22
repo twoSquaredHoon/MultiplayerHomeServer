@@ -4,85 +4,126 @@ Cross-platform multiplayer game (PC, Mac, Linux, Android, iOS) with a self-hoste
 
 **Done when:** a friend on their phone and you on Linux join the same lobby code from different houses and play.
 
-## Architecture
+## How it works
 
 ```
 Players (PC / phone / Linux)
-        │
+        │  1. log in, host or join a lobby (HTTP :8080)
+        │  2. play on the game server the API gives back (UDP 7770–7790)
 Tailscale  or  router port forward
         │
-┌─────── Home server (Ubuntu + Docker Compose) ───────┐
-│  Go API  (:8080)  ── login, lobby codes             │
-│  Game servers (UDP 7770–7790) ── one per match      │
-│  Postgres ── accounts, saves                        │
-│  Redis    ── lobbies, online players                │
-└─────────────────────────────────────────────────────┘
+┌──────────── Home server (Ubuntu + Docker Compose) ─────────────┐
+│  Go API (:8080)   login, lobby codes, starts/stops game servers │
+│  Game servers     one Unity container per lobby, UDP            │
+│  Postgres         accounts                                      │
+│  Redis            lobbies, port reservations                    │
+│  Prometheus + Grafana (:3000)   players, servers, CPU, memory   │
+└────────────────────────────────────────────────────────────────┘
 ```
+
+When someone hosts a lobby, the API reserves a UDP port, starts a game server container on it, and returns the code. Game servers send a heartbeat every 5 seconds with their player count. The API shuts a game server down when its lobby expires (2 hours), it stops sending heartbeats (2 minutes), or it has had no players for 5 minutes.
 
 ## Stack
 
 | Part | Tech |
 |---|---|
-| Game client + game server | Unity (C#) + FishNet, headless Linux build for the server |
-| Backend API | Go (net/http), JWT auth |
+| Game client + game server | Unity 6 (C#) + FishNet, headless Linux build for the server |
+| Backend API | Go (net/http), JWT auth, Docker Engine API for game servers |
 | Database | PostgreSQL |
 | Cache / live state | Redis |
 | Running it | Docker + Docker Compose on Ubuntu Server |
 | Remote access | Tailscale first, port forward + DDNS later |
-| CI/CD | GitHub Actions → GHCR |
-| Monitoring | Prometheus + Grafana |
+| CI/CD | GitHub Actions build check, `update.sh` auto-deploys from GitHub |
+| Monitoring | Prometheus + node-exporter + Grafana |
+| Backups | nightly `pg_dump` via cron |
 
 ## Repo layout
 
 ```
-api/            Go backend (login, lobbies)
-game/           Unity project (client + headless server build)
-deploy/         docker-compose.yml, .env
+api/            Go backend
+game/           Unity project (scripts in Assets/Scripts, setup steps in game/README.md)
+deploy/         docker-compose.yml, .env, monitoring config, backup/update/push scripts
 server-setup/   one-time Ubuntu server setup script
-.github/        CI workflows
+.github/        GitHub Actions workflow (builds the API on every push)
 ```
 
-## Phases
+## Status
 
-### Phase 1 — Server setup (weekend)
-- [ ] Install Ubuntu Server on the spare PC
-- [ ] SSH keys, `ufw` firewall
-- [ ] Fixed LAN IP (DHCP reservation in router)
-- [ ] Docker, Docker Compose, Tailscale → run `server-setup/setup-ubuntu.sh`
+| Phase | Status |
+|---|---|
+| 1. Server setup | Script ready: `server-setup/setup-ubuntu.sh` |
+| 2. Unity game | Scripts written; scene + prefab are made in the editor (`game/README.md`) |
+| 3. Go backend | Done |
+| 4. Game server per lobby | Done (start, heartbeat, auto-shutdown) |
+| 5. Friends | Steps below |
+| 6. Automation + monitoring | Done: CI, auto-update, Grafana dashboard, backups |
 
-### Phase 2 — Minimal game (1–2 weeks)
-- [ ] Unity + FishNet: players move and see each other
-- [ ] Headless Linux server build + `Dockerfile`
-- [ ] Two clients on home Wi-Fi
+## Setup
 
-### Phase 3 — Go backend (1–2 weeks)
-- [x] Starter API in `api/` (register, login, create lobby, join lobby)
-- [ ] Run with `docker compose up` and test with curl
-- [ ] Unity client calls the API, then connects to the returned IP/port
+### 1. Server (once)
+On the Ubuntu PC:
+```bash
+git clone https://github.com/twoSquaredHoon/MultiplayerHomeServer.git
+cd MultiplayerHomeServer
+bash server-setup/setup-ubuntu.sh
+```
+Then in the router admin page, give the server a fixed LAN IP (DHCP reservation).
 
-### Phase 4 — Match servers (1 week)
-- [ ] API starts a game server container per lobby (Docker SDK for Go)
-- [ ] Game server heartbeat → API; API shuts down empty servers
-
-### Phase 5 — Let friends in (few days)
-- [ ] Tailscale: share server with friends
-- [ ] Later: port forward TCP 8080 + UDP 7770–7790, ASUS DDNS
-
-### Phase 6 — Automation + monitoring (1 week)
-- [ ] GitHub Actions builds images → GHCR, server pulls new versions
-- [ ] Prometheus + Grafana (players online, matches, CPU)
-- [ ] Nightly `pg_dump` backup via cron
-
-## Run the backend locally
-
+### 2. Backend
 ```bash
 cd deploy
-cp .env.example .env      # then change JWT_SECRET and POSTGRES_PASSWORD
-docker compose up --build
+cp .env.example .env     # set passwords, PUBLIC_HOST = output of: tailscale ip -4
+docker compose up -d --build
+curl localhost:8080/health
 ```
 
-Test it:
+### 3. Game
+Follow `game/README.md`, then load the server build onto the home server from your Mac:
+```bash
+./deploy/push-gameserver.sh you@your-server
+```
+On the server, set `GAME_SERVER_IMAGE=multiplayer-gameserver:latest` in `deploy/.env` and run `docker compose up -d`.
 
+### 4. Let friends in (Phase 5)
+**Tailscale (start here):**
+1. tailscale.com admin console → Machines → your server → **Share** → send the link to a friend.
+2. Friend installs Tailscale (Windows, Mac, Linux, iOS, Android) and accepts the share.
+3. Clients use `http://<server Tailscale IP>:8080` as the API URL, the same as `PUBLIC_HOST`.
+
+**Port forwarding (later, anyone on the internet):**
+1. Router admin (ASUS) → WAN → Virtual Server / Port Forwarding: TCP **8080** and UDP **7770–7790** → the server's LAN IP.
+2. ASUS → WAN → DDNS → turn on, pick a name like `yourname.asuscomm.com`.
+3. Set `PUBLIC_HOST=yourname.asuscomm.com` in `deploy/.env`, set the clients' API URL to `http://yourname.asuscomm.com:8080`, and `docker compose up -d`.
+
+Don't forward port 3000 (Grafana); open it over Tailscale only.
+
+### 5. Automation (Phase 6)
+On the server, `crontab -e` and add:
+```
+*/10 * * * * /home/YOU/MultiplayerHomeServer/deploy/update.sh >> /tmp/update.log 2>&1
+0 4 * * *    /home/YOU/MultiplayerHomeServer/deploy/backup.sh >> /tmp/backup.log 2>&1
+```
+- `update.sh` pulls from GitHub every 10 minutes and rebuilds if something changed.
+- `backup.sh` saves the database to `deploy/backups/` every night and keeps 14 days.
+- Restore a backup: `gunzip -c backups/game-DATE.sql.gz | docker compose exec -T postgres psql -U game game`
+
+
+### 6. Monitoring
+Open `http://<server Tailscale IP>:3000`, log in as `admin` / `GRAFANA_PASSWORD`, open the **Multiplayer server** dashboard: players online, game servers, lobbies, accounts, CPU and memory.
+
+## API
+
+| Method | Path | Auth | Returns |
+|---|---|---|---|
+| GET | `/health` | no | `ok` |
+| GET | `/metrics` | no | Prometheus metrics |
+| POST | `/register` | no | `{id}` |
+| POST | `/login` | no | `{token}` |
+| POST | `/lobbies` | token | `{code, host, port}`, starts a game server |
+| POST | `/lobbies/{code}/join` | token | `{code, host, port}` |
+| POST | `/servers/heartbeat` | `X-Server-Key` | game servers only: `{port, players}` |
+
+Test without the game:
 ```bash
 curl -X POST localhost:8080/register -d '{"username":"hoon","password":"pass1234"}'
 TOKEN=$(curl -s -X POST localhost:8080/login -d '{"username":"hoon","password":"pass1234"}' | sed 's/.*"token":"\([^"]*\)".*/\1/')
@@ -90,16 +131,6 @@ curl -X POST localhost:8080/lobbies -H "Authorization: Bearer $TOKEN"
 curl -X POST localhost:8080/lobbies/ABCD/join -H "Authorization: Bearer $TOKEN"
 ```
 
-## API
-
-| Method | Path | Auth | Returns |
-|---|---|---|---|
-| GET | `/health` | no | `ok` |
-| POST | `/register` | no | `{id}` |
-| POST | `/login` | no | `{token}` |
-| POST | `/lobbies` | yes | `{code, host, port}` |
-| POST | `/lobbies/{code}/join` | yes | `{code, host, port}` |
-
 ## Resume line
 
-Self-hosted cross-platform multiplayer backend: Go API, per-match Dockerized game servers, Postgres/Redis, CI/CD, Grafana monitoring.
+Self-hosted cross-platform multiplayer backend: Go API that spins up per-match Dockerized Unity game servers, Postgres/Redis, CI/CD, Prometheus/Grafana monitoring.

@@ -11,6 +11,7 @@ echo "== Firewall =="
 sudo ufw allow OpenSSH
 sudo ufw allow 8080/tcp          # Go API
 sudo ufw allow 7770:7790/udp     # game servers
+sudo ufw allow in on tailscale0   # anything from your Tailscale devices (Grafana on :3000)
 sudo ufw --force enable
 
 echo "== Docker =="

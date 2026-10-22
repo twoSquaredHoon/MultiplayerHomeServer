@@ -1,4 +1,3 @@
-# Move this file to .github/workflows/api.yml
 name: api
 
 on:
