@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"log"
 	"net/http"
 	"strconv"
@@ -53,40 +52,68 @@ func heartbeat(w http.ResponseWriter, r *http.Request) {
 		Port    int `json:"port"`
 		Players int `json:"players"`
 	}
-	if json.NewDecoder(r.Body).Decode(&body) != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
+	if !readJSON(w, r, &body) {
 		return
 	}
 
 	serversMu.Lock()
-	defer serversMu.Unlock()
 	s, ok := servers[body.Port]
+	code := ""
+	if ok {
+		s.players = body.Players
+		s.lastHeartbeat = time.Now()
+		if body.Players > 0 {
+			s.lastHadPlayers = time.Now()
+		}
+		code = s.code
+	}
+	serversMu.Unlock()
+
 	if !ok {
 		http.Error(w, "unknown server", http.StatusNotFound)
 		return
 	}
-	s.players = body.Players
-	s.lastHeartbeat = time.Now()
+
+	// Keep the lobby alive while people are playing, so a long match isn't cut off at lobbyTTL.
 	if body.Players > 0 {
-		s.lastHadPlayers = time.Now()
+		ctx := r.Context()
+		rdb.Expire(ctx, "lobby:"+code, lobbyTTL)
+		rdb.Expire(ctx, "port:"+strconv.Itoa(body.Port), lobbyTTL)
 	}
 	w.Write([]byte("ok"))
 }
 
 // Every few seconds, shut down game servers that are expired, dead, or empty.
 func cleanupLoop() {
+	type toStop struct {
+		port int
+		s    *gameServer
+	}
 	for {
 		time.Sleep(checkEvery)
 		ctx := context.Background()
 
+		// Copy the list so the lock isn't held during Redis/Docker calls
+		// (heartbeats and /metrics would wait on it otherwise).
 		serversMu.Lock()
+		list := []toStop{}
 		for port, s := range servers {
+			list = append(list, toStop{port, s})
+		}
+		serversMu.Unlock()
+
+		for _, item := range list {
+			port, s := item.port, item.s
+			serversMu.Lock()
+			lastHeartbeat, lastHadPlayers := s.lastHeartbeat, s.lastHadPlayers
+			serversMu.Unlock()
+
 			reason := ""
 			if rdb.Exists(ctx, "lobby:"+s.code).Val() == 0 {
 				reason = "lobby expired"
-			} else if time.Since(s.lastHeartbeat) > heartbeatLimit {
+			} else if time.Since(lastHeartbeat) > heartbeatLimit {
 				reason = "no heartbeat"
-			} else if time.Since(s.lastHadPlayers) > emptyLimit {
+			} else if time.Since(lastHadPlayers) > emptyLimit {
 				reason = "empty"
 			}
 			if reason == "" {
@@ -94,12 +121,24 @@ func cleanupLoop() {
 			}
 
 			log.Printf("stopping game server for lobby %s on port %d (%s)", s.code, port, reason)
+			serversMu.Lock()
+			delete(servers, port)
+			serversMu.Unlock()
 			dockerRemove(s.containerID)
 			deleteLobby(s.code, port)
-			delete(servers, port)
 		}
-		serversMu.Unlock()
 	}
+}
+
+// scanKeys returns all Redis keys matching pattern. Uses SCAN instead of KEYS,
+// which blocks Redis while it walks every key.
+func scanKeys(ctx context.Context, pattern string) []string {
+	keys := []string{}
+	iter := rdb.Scan(ctx, 0, pattern, 100).Iterator()
+	for iter.Next(ctx) {
+		keys = append(keys, iter.Val())
+	}
+	return keys
 }
 
 func deleteLobby(code string, port int) {
@@ -122,7 +161,7 @@ func removeOldGameServers() {
 
 	// Old lobbies point at game servers that no longer exist.
 	for _, pattern := range []string{"lobby:*", "port:*"} {
-		keys := rdb.Keys(ctx, pattern).Val()
+		keys := scanKeys(ctx, pattern)
 		if len(keys) > 0 {
 			rdb.Del(ctx, keys...)
 		}

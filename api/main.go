@@ -39,7 +39,14 @@ func main() {
 		log.Fatal(err)
 	}
 	rdb = redis.NewClient(&redis.Options{Addr: os.Getenv("REDIS_ADDR")})
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		log.Fatal("redis: ", err)
+	}
 	jwtSecret = []byte(os.Getenv("JWT_SECRET"))
+	// An empty secret would let anyone make valid login tokens.
+	if len(jwtSecret) < 16 {
+		log.Fatal("JWT_SECRET must be set (16+ chars)")
+	}
 	publicHost = os.Getenv("PUBLIC_HOST")
 	gameImage = os.Getenv("GAME_SERVER_IMAGE")
 	gameNetwork = os.Getenv("GAME_NETWORK")
@@ -70,5 +77,14 @@ func main() {
 	mux.HandleFunc("POST /servers/heartbeat", heartbeat)
 
 	log.Println("API listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", mux))
+	// Timeouts so a slow or stuck client can't hold a connection open forever.
+	srv := &http.Server{
+		Addr:              ":8080",
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	log.Fatal(srv.ListenAndServe())
 }

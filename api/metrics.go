@@ -18,7 +18,7 @@ func metrics(w http.ResponseWriter, r *http.Request) {
 	}
 	serversMu.Unlock()
 
-	lobbies := len(rdb.Keys(ctx, "lobby:*").Val())
+	lobbies := len(scanKeys(ctx, "lobby:*"))
 
 	users := 0
 	db.QueryRow(ctx, "SELECT count(*) FROM users").Scan(&users)

@@ -2,12 +2,15 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -18,18 +21,34 @@ type credentials struct {
 
 func register(w http.ResponseWriter, r *http.Request) {
 	var c credentials
-	if json.NewDecoder(r.Body).Decode(&c) != nil || c.Username == "" || len(c.Password) < 8 {
-		http.Error(w, "need username and password (8+ chars)", http.StatusBadRequest)
+	if !readJSON(w, r, &c) {
 		return
 	}
-	hash, _ := bcrypt.GenerateFromPassword([]byte(c.Password), bcrypt.DefaultCost)
+	c.Username = strings.TrimSpace(c.Username)
+	// bcrypt only works on the first 72 bytes and errors on anything longer.
+	if c.Username == "" || len(c.Username) > 32 || len(c.Password) < 8 || len(c.Password) > 72 {
+		http.Error(w, "need username (1-32 chars) and password (8-72 chars)", http.StatusBadRequest)
+		return
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(c.Password), bcrypt.DefaultCost)
+	if err != nil {
+		log.Println("bcrypt:", err)
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
 
 	var id int
-	err := db.QueryRow(r.Context(),
+	err = db.QueryRow(r.Context(),
 		"INSERT INTO users (username, password_hash) VALUES ($1, $2) RETURNING id",
 		c.Username, string(hash)).Scan(&id)
-	if err != nil {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" { // unique_violation
 		http.Error(w, "username taken", http.StatusConflict)
+		return
+	}
+	if err != nil {
+		log.Println("register:", err)
+		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, map[string]any{"id": id})
@@ -37,10 +56,10 @@ func register(w http.ResponseWriter, r *http.Request) {
 
 func login(w http.ResponseWriter, r *http.Request) {
 	var c credentials
-	if json.NewDecoder(r.Body).Decode(&c) != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
+	if !readJSON(w, r, &c) {
 		return
 	}
+	c.Username = strings.TrimSpace(c.Username)
 	var id int
 	var hash string
 	err := db.QueryRow(r.Context(),
@@ -71,6 +90,16 @@ func auth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+// readJSON decodes a small JSON body into v. On failure it writes a 400 and returns false.
+func readJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	if json.NewDecoder(r.Body).Decode(v) != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return false
+	}
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

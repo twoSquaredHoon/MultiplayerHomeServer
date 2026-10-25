@@ -11,24 +11,10 @@ import (
 func createLobby(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Pick a lobby code that isn't in use.
-	code := ""
-	for i := 0; i < 10; i++ {
-		c := randomCode()
-		if rdb.Exists(ctx, "lobby:"+c).Val() == 0 {
-			code = c
-			break
-		}
-	}
-	if code == "" {
-		http.Error(w, "could not make a lobby code", http.StatusServiceUnavailable)
-		return
-	}
-
 	// Grab the first free UDP port. The key expires with the lobby, so the port frees itself.
 	port := 0
 	for p := firstPort; p <= lastPort; p++ {
-		if rdb.SetNX(ctx, fmt.Sprintf("port:%d", p), code, lobbyTTL).Val() {
+		if rdb.SetNX(ctx, fmt.Sprintf("port:%d", p), "taken", lobbyTTL).Val() {
 			port = p
 			break
 		}
@@ -38,7 +24,21 @@ func createLobby(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rdb.HSet(ctx, "lobby:"+code, "port", port)
+	// Pick a lobby code that isn't in use. HSetNX claims it in one step,
+	// so two requests can't end up with the same code.
+	code := ""
+	for i := 0; i < 10; i++ {
+		c := randomCode()
+		if rdb.HSetNX(ctx, "lobby:"+c, "port", port).Val() {
+			code = c
+			break
+		}
+	}
+	if code == "" {
+		rdb.Del(ctx, fmt.Sprintf("port:%d", port))
+		http.Error(w, "could not make a lobby code", http.StatusServiceUnavailable)
+		return
+	}
 	rdb.Expire(ctx, "lobby:"+code, lobbyTTL)
 
 	// Start a game server for this lobby.

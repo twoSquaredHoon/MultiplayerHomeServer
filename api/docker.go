@@ -12,11 +12,13 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"time"
 )
 
 const gameServerLabel = "multiplayer.gameserver"
 
 var dockerClient = &http.Client{
+	Timeout: 20 * time.Second, // don't hang a request if Docker stops responding
 	Transport: &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", "/var/run/docker.sock")
